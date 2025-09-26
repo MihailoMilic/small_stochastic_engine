@@ -36,8 +36,8 @@ class GaussianJumpMeasure(LevyMeasure):
         return np.random.normal(self.muJ, self.sigJ, size = (n, ))
     def small_jump_var(self, eps: float) -> float:
         grid = np.linspace(-eps, eps, 4096)
-        pdf = norm.pdf((grid - self.muJ)/self.sigJ) / self.sigJ 
-
+        pdf = norm.pdf((grid - self.muJ)/self.sigJ) / self.sigJ
+        # Use np.trapz for broad NumPy compatibility
         m2 = np.trapezoid(grid**2 * pdf, grid)
         return float(self.lam * m2)
 
@@ -62,15 +62,17 @@ class TruncatedLevyIncrement:
       
         N = np.random.poisson(lam * dt, size=size).astype(int)
 
-
         out = cont + small
-       
         flat = out.reshape(-1)
         N_flat = N.reshape(-1)
-        idx = 0
-        for k in range(flat.size):
-            m = N_flat[k]
-            if m > 0:
-                J = self.measure.sample_large_jumps(m)    
-                flat[k] += J.sum()
+
+        # Vectorized accumulation of large jumps:
+        # build repeated indices per element count and add sampled jumps in one go
+        total_jumps = int(N_flat.sum())
+        if total_jumps > 0:
+            # indices repeated by number of jumps per entry
+            idx_rep = np.repeat(np.arange(N_flat.size, dtype=int), N_flat)
+            J = self.measure.sample_large_jumps(total_jumps)
+            # accumulate sums into flat using in-place indexed addition
+            np.add.at(flat, idx_rep, J)
         return flat.reshape(size)

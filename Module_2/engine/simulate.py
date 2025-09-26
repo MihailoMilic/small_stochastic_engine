@@ -2,9 +2,9 @@
 from dataclasses import dataclass
 import numpy as np
 from numpy.random import Generator, PCG64
-from .model import RegimeSwitchingModel
+# Avoid importing model types here to prevent circular imports
 from typing import Optional
-from .types import Model, Discretization, Array
+from .types import Model, Discretization, Array, RegimeSwitching
 from .rng import PRNG
 @dataclass
 class Simulator:
@@ -25,8 +25,8 @@ class Simulator:
         dim = self.model.dim
         paths = np.zeros((self.num_steps+1, self.num_paths, dim), dtype=np.float64)
         x = np.broadcast_to(self.model.init, (self.num_paths, dim)).copy()
-        if isinstance(self.model, RegimeSwitchingModel):
-            self.model.prepare_regimes(self.num_paths, self.num_steps,Generator(PCG64(self.seed)))
+        if isinstance(self.model, RegimeSwitching):
+            self.model.prepare_regimes(self.num_paths, self.num_steps, Generator(PCG64(self.seed)))
 
         paths[0] = x
 
@@ -38,7 +38,7 @@ class Simulator:
         t = 0.0
         for k in range(self.num_steps):
             # scheme expects x (N, dim) and dW (N, dimW or dim)
-            if isinstance(self.model, RegimeSwitchingModel):
+            if isinstance(self.model, RegimeSwitching):
                 self.model.advance_regime()
             x = self.scheme.step(self.model, x, t, self.dt, dW[k])
             paths[k+1] = x

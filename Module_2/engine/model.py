@@ -1,12 +1,19 @@
 # sde/model.py
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
-from .types import Array, Model
-from typing import Optional
-from .levy import TruncatedLevyIncrement, LevyTriplet
+
+from engine.calibration import MLECalibrator, SurfaceCalibrator, MLEProtocol, SurfaceProtocol
+from engine.types import Array, Model
+from typing import Optional, TYPE_CHECKING
+if TYPE_CHECKING:
+    from engine.pricer import PricerProtocol
+from engine.levy import TruncatedLevyIncrement, LevyTriplet
 from scipy.linalg import expm
+from scipy.stats import norm
+from scipy.special import factorial
+import pandas as pd
 @dataclass(frozen=True)
-class GBM(Model):
+class GBM(Model, MLEProtocol):
     mu: float
     sigma: float
     s0: float
@@ -30,15 +37,27 @@ class GBM(Model):
         return np.zeros_like(x, dtype=np.float64)  # no jumps
     def extra_terms(self, x: Array, t: float, dt: float, dW: Array) -> Array:
         return np.zeros_like(x, dtype=np.float64)  # no extra terms
+    def loglike(self, theta, returns, dt):
+        mu, sigma = theta["mu"], theta["sigma"]
+        mean = mu * dt
+        var = sigma**2 * dt
+        if var <=0:
+            return -np.inf
+        resid = returns - mean
+        return -0.5*(len(returns)*np.log(2*np.pi*var) + np.sum(resid**2)/var)
+    def _default_calibrator(self):
+        return MLECalibrator()
+
 
 @dataclass(frozen=True)
-class MertonJD(Model):
+class MertonJD(Model, MLEProtocol, SurfaceProtocol):
     mu: float
     sigma: float
     lam: float      # jump intensity
     muJ: float      # jump mean
     sigmaJ: float   # jump stddev
     s0: float
+    max_jumps: int = 10  # truncate Poisson at k=max_jumps for likelihood
     @property
     def dim(self) -> int: return 1
     @property
@@ -60,10 +79,50 @@ class MertonJD(Model):
             Y = np.random.lognormal(self.muJ, self.sigmaJ, size = x.shape)
             return (Y-1.0) * x * n_jumps
         return np.zeros_like(x, dtype=np.float64)
+    def loglike(self, theta, returns, dt):
+        mu, sigma, lam, m, delta = (theta[k] for k in ["mu","sigma","lam","muJ","sigmaJ"])
+        ll = 0.0
+        for r in returns:
+            # mixture over small k (truncated Poisson)
+            mix = 0.0
+            for k in range(0, self.max_jumps):  # truncate at k=max_jumps
+                weight = np.exp(-lam*dt) * (lam*dt)**k / factorial(k)
+                mean = mu*dt + k*m
+                var  = sigma**2*dt + k*delta**2
+                mix += weight * (1/np.sqrt(2*np.pi*var)) * np.exp(-(r-mean)**2/(2*var))
+            ll += np.log(mix + 1e-12)  # numerical stability
+        return ll
+    def charfunc(self, u, T, S0, r=0.0):
+        """Characteristic function of ln S_T for Merton jump-diffusion.
+        Supports scalar or vector `u` inputs.
+        """
+        u = np.asarray(u, dtype=np.complex128)
+        mu, sigma, lam, m, delta = self.mu, self.sigma, self.lam, self.muJ, self.sigmaJ
+        k = np.exp(m + 0.5 * delta**2) - 1.0  # E[e^J] - 1, J ~ N(m, delta^2)
+        drift = r - lam * k - 0.5 * sigma**2
+        return np.exp(
+            1j * u * (np.log(S0) + drift * T)
+            - 0.5 * sigma**2 * u**2 * T
+            + lam * T * (np.exp(1j * u * m - 0.5 * delta**2 * u**2) - 1.0)
+        )
     def extra_terms(self, x: Array, t: float, dt: float, dW: Array) -> Array:
         return np.zeros_like(x, dtype=np.float64)  # no extra terms
+       # === Option Pricing (Carr–Madan) ===
 
-
+    def option_prices(self, theta, strikes, maturities, S0, r=0.0, pricer: Optional["PricerProtocol"] = None) -> np.ndarray:
+        prices = []
+        for K, T in zip(strikes, maturities):
+            if pricer is not None:
+                price, _ = pricer.price(self, K, T, S0, r)
+                prices.append(price)
+            else:
+                from engine.pricer import CarrMadanPricer
+                cm_pricer = CarrMadanPricer()
+                price, _ = cm_pricer.price(self, K, T, S0, r)
+                prices.append(price)
+        return np.array(prices)
+    def _default_calibrator(self):
+        return MLECalibrator()
 @dataclass(frozen=True)
 class AdditiveLevyModel(Model):
     """1D additive Lévy process: dX_t = dL_t with triplet (b,σ,ν)."""
@@ -90,7 +149,7 @@ class AdditiveLevyModel(Model):
 
 
 @dataclass(frozen=True)
-class Heston(Model):
+class Heston(Model, SurfaceProtocol):
     # Risk-neutral Heston:
     # dS = r S dt + sqrt(v) S dW1
     # dv = kappa (theta - v) dt + xi sqrt(v) dW2
@@ -154,14 +213,46 @@ class Heston(Model):
         L = np.array([[1.0, 0.0],
               [self.rho, np.sqrt(1.0 - self.rho**2)]])
         return L
+    # === Characteristic Function of log-price ===
+    def charfunc(self, u: complex, T: float, S0: float, r: float = 0.0) -> complex:
+        kappa, theta, xi, rho, v0 = self.kappa, self.theta, self.xi, self.rho, self.v0
+
+        d = np.sqrt((rho * xi * 1j * u - kappa)**2 + (xi**2) * (1j * u + u**2))
+        g = (kappa - rho * xi * 1j * u - d) / (kappa - rho * xi * 1j * u + d)
+
+        C = (r * 1j * u * T +
+             (kappa * theta / (xi**2)) *
+             ((kappa - rho * xi * 1j * u - d) * T -
+              2 * np.log((1 - g * np.exp(-d * T)) / (1 - g))))
+        D = ((kappa - rho * xi * 1j * u - d) / (xi**2)) * ((1 - np.exp(-d * T)) / (1 - g * np.exp(-d * T)))
+
+        return np.exp(C + D * v0 + 1j * u * np.log(S0))
+
+    def _default_calibrator(self):
+        # Use a derivative-free method for robustness on nonconvex SABR MSE surfaces
+        return SurfaceCalibrator(method="Powell")
+
+    # === Required for SurfaceInterface ===
+    def option_prices(self, theta: dict, strikes: np.ndarray, maturities: np.ndarray,
+                      S0: float, r: float = 0.0, pricer: Optional["PricerProtocol"] = None) -> np.ndarray:
+        # replace self with new params for consistency
+        model = replace(self, **theta)
+        prices = []
+        for K, T in zip(strikes, maturities):
+            if pricer is not None:
+                price, _ = pricer.price(model, K, T, S0, r)
+                prices.append(price)
+            else:
+                from engine.pricer import CarrMadanPricer
+                cm_pricer = CarrMadanPricer()
+                price, _ = cm_pricer.price(model, K, T, S0, r)
+                prices.append(price)
+        return np.array(prices)
     # For barriers or tight accuracy, reduce dt or add Brownian-bridge logic for crossings on S (you already have a bridge generator in brownian.py for QMC—nice).
 # sde/model.py
-from dataclasses import dataclass
-import numpy as np
-from .types import Array, Model
 
 @dataclass(frozen=True)
-class SABR(Model):
+class SABR(Model, SurfaceProtocol):
     # dF = mu * F dt + alpha * F^beta dW1
     # dalpha = nu * alpha dW2
     # corr(dW1, dW2) = rho
@@ -224,10 +315,82 @@ class SABR(Model):
         L = np.array([[1.0, 0.0],
                 [self.rho, np.sqrt(1.0 - self.rho**2)]])
         return L
-    
+    # --- Hagan et al. (2002) lognormal implied vol approximation ---
+    def implied_vol(self, F: float, K: float, T: float) -> float:
+        # handle ATM limit robustly
+        if F <= 0 or K <= 0 or T <= 0:
+            return np.nan
+        a, b, r, n = self.alpha0, self.beta, self.rho, self.nu
+        if a <= 0 or n <= 0 or not (-0.999 < r < 0.999) or not (0.0 <= b <= 1.0):
+            return np.nan
+
+        logFK = np.log(F/K)
+        # power mean factor
+        FK_beta = (F * K) ** ((1.0 - b) / 2.0)
+
+        # z and x(z)
+        z = (n / a) * FK_beta * logFK if abs(logFK) > 1e-12 else 0.0
+        # x(z) as in Hagan
+        if abs(z) < 1e-12:
+            x_z = 1.0
+        else:
+            tmp = np.sqrt(1.0 - 2.0 * r * z + z * z)
+            x_z = np.log((tmp + z - r) / (1.0 - r))
+
+        # Denominator correction in log-strike
+        log_corr = 1.0 + ((1 - b) ** 2 / 24.0) * (logFK ** 2) + ((1 - b) ** 4 / 1920.0) * (logFK ** 4)
+
+        # Time-dependent correction
+        A = ((1 - b) ** 2 / 24.0) * (a * a) / (FK_beta ** 2)
+        B = (r * b * n * a) / (4.0 * FK_beta)
+        C = ((2.0 - 3.0 * r * r) / 24.0) * (n * n)
+        time_corr = 1.0 + (A + B + C) * T
+
+        # Final implied vol
+        vol = (a / (FK_beta * log_corr)) * (z / x_z if x_z != 0 else 1.0) * time_corr
+        return max(vol, 1e-12)
+
+    # --- Vectorized surface pricing hook for SurfaceCalibrator ---
+    def option_prices(
+        self,
+        theta: dict[str, float],
+        strikes: np.ndarray,
+        maturities: np.ndarray,
+        s0: float,
+        r: float = 0.0,
+        call_put: np.ndarray | None = None,  # +1 for calls, -1 for puts; if None assume calls
+        pricer: Optional["PricerProtocol"] = None
+    ) -> np.ndarray:
+        model = replace(self, **theta) if theta else self
+        strikes = np.asarray(strikes, dtype=float)
+        maturities = np.asarray(maturities, dtype=float)
+        if call_put is None:
+            call_put = np.ones_like(strikes)
+        call_put = np.asarray(call_put, dtype=float)
+
+        prices = np.empty_like(strikes, dtype=float)
+        for i, (K, T, cp) in enumerate(zip(strikes, maturities, call_put)):
+            df = np.exp(-r * T)
+            F = s0 * np.exp(r * T)  # forward (no carry)
+            # Option price using provided pricer or Black with model's implied vol
+            if pricer is not None:
+                call, _ = pricer.price(model, K, T, s0, r)
+            else:
+                from engine.pricer import BlackPricer
+                black_pricer = BlackPricer()
+                call, _ = black_pricer.price(model, K, T, s0, r)
+            if cp >= 0:
+                prices[i] = call
+            else:
+                # put from call via Black put-call parity on forwards
+                prices[i] = call - df * (F - K)
+        return prices
+    def _default_calibrator(self):
+        # Derivative-free is often more robust for SABR surface MSE
+        return SurfaceCalibrator(method="Powell")
 
 @dataclass
-class RegimeSwitchingModel(Model):
+class RegimeSwitchingModel:
     models: list[Model]            
     Q: np.ndarray                
     pi0: np.ndarray               
@@ -248,21 +411,29 @@ class RegimeSwitchingModel(Model):
 
     def prepare_regimes(self, N: int, T: int, rng: np.random.Generator):
         K = len(self.models)
- 
+
+        # Transition matrix and normalization
         P = expm(self.Q * self.dt)
- 
         P = np.clip(P, 0.0, None)
         row_sums = P.sum(axis=1, keepdims=True)
-     
         row_sums[row_sums == 0.0] = 1.0
         P = P / row_sums
+        Pc = np.cumsum(P, axis=1)  # cumulative probabilities per current state
+
+        # Allocate regime path matrix
         self._regimes = np.zeros((T + 1, N), dtype=int)
+        # Initial regimes from initial distribution
         self._regimes[0] = rng.choice(K, size=N, p=self.pi0)
 
+        # Vectorized per-step categorical sampling using cumulative probabilities
         for t in range(1, T + 1):
-            for n in range(N):
-                i = self._regimes[t - 1, n]
-                self._regimes[t, n] = rng.choice(K, p=P[i])
+            prev = self._regimes[t - 1]                 # shape (N,)
+            U = rng.random(N)                           # shape (N,)
+            # Select cumulative row for each path's current state
+            cum_rows = Pc[prev]                         # shape (N, K)
+            # Next state = number of entries strictly less than U
+            next_states = (cum_rows < U[:, None]).sum(axis=1).astype(int)
+            self._regimes[t] = next_states
 
         self._t_index = 0
         self.current_regime = self._regimes[0]
