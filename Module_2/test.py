@@ -4,7 +4,7 @@ from dataclasses import asdict, replace
 
 from engine.model import GBM, MertonJD, Heston, SABR
 
-Array = np.ndarray
+
 
 
 def test_gbm_default_calibration():
@@ -124,3 +124,110 @@ if __name__ == "__main__":
     test_mertonjd_default_calibration()
     test_heston_default_calibration()
     test_sabr_default_calibration()
+
+"""
+Regime-switching (2-state HMM) calibration via MLE using scipy.optimize.minimize.
+
+Design goals from the user's spec:
+- A Calibrator engine implemented as a class with method
+    fit(self, model, market_data, start_params, bounds)
+  returning (OptimizeResult, dict_of_param_values)
+- A Protocol for the calibrator's expected model interface.
+- RegimeSwitchingModel implements the required Protocol methods.
+
+Model:
+  r_t | s_t = k  ~  Normal(mu_k, sigma_k^2)
+  s_t is a 2-state Markov chain with transition matrix P.
+
+Parameterization (unconstrained for stable optimization):
+  theta = [mu1, mu2, log_sigma1, log_sigma2, logit_p11, logit_p22]
+  where
+    sigma_k = exp(log_sigma_k)
+    p11 = sigmoid(logit_p11) = 1/(1+exp(-x))
+    p22 = sigmoid(logit_p22)
+    P = [[p11, 1-p11], [1-p22, p22]]
+Initial distribution:
+  By default, stationary distribution of P (can be overridden by market_data).
+
+Objective:
+  Negative log-likelihood computed by the forward algorithm with log scaling.
+
+Notes:
+  - "market_data" for this calibrator expects an object providing returns as a
+    1D numpy array. A simple ReturnsData class is included for convenience.
+  - Bounds should be provided in the same order as theta above.
+  - You can extend to K>2 states by generalizing softmax/transition
+    parameterization and emissions; kept 2-state for clarity and speed.
+"""
+
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable, Optional, Tuple, Dict, Any
+import numpy as np
+
+
+
+
+
+############################
+# Model implementation (2-state)
+############################
+
+class RegimeSwitchingModel(RegimeSwitchingCalibratable):
+    """Two-state Gaussian HMM for returns.
+
+    Parameters are represented via unconstrained optimizer vector theta with
+    order given by self._param_order.
+    """
+
+
+    
+############################
+# Calibrator engine
+############################
+
+
+"""
+Generalized regime-switching (K-state HMM) calibration via MLE using scipy.optimize.minimize.
+Flexible number of states K with softmax transition parametrization.
+
+Design goals:
+- Calibrator engine class with fit(self, model, market_data, start_params, bounds)
+  returning OptimizeResult and param dict.
+- Protocol for calibratable models.
+- RegimeSwitchingModel implementing required Protocol methods for arbitrary K.
+
+Model:
+  r_t | s_t = k  ~ Normal(mu_k, sigma_k^2)
+  s_t is K-state Markov chain with transition matrix P (row-stochastic).
+
+Parameterization:
+  theta = [mu_1..mu_K, log_sigma_1..log_sigma_K, logits for transitions]
+  Transition logits are flattened row-wise: for each i, logits_i (length K)
+  produce P[i,:] = softmax(logits_i)
+
+Objective:
+  Negative log-likelihood via log-space forward algorithm.
+"""
+
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable, Optional, Tuple, Dict, Any
+import numpy as np
+from scipy.optimize import minimize, OptimizeResult
+
+############################
+# Protocols
+############################
+
+
+
+############################
+# Model implementation
+############################
+
+class RegimeSwitchingModel(RegimeSwitchingCalibratable):
+    def __init__(self, n_states: int):
+        if n_states < 2:
+            raise ValueError("Need at least 2 states")
+        self.K = n_states
+
+   

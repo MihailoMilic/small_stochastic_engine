@@ -1,6 +1,7 @@
 from .types import  Model, Discretization, Array
-from typing import Optional, Protocol
-from scipy.optimize import minimize
+from typing import Optional, Protocol, runtime_checkable, Tuple, Any, Dict
+from dataclasses import dataclass
+from scipy.optimize import minimize, OptimizeResult
 import numpy as np
 import pandas as pd
 import dataclasses
@@ -163,3 +164,61 @@ class SurfaceCalibrator:
         res = minimize(objective, x0, method = self.method, bounds=bounds, options={"maxiter": self.maxiter})
         theta_hat = {n: res.x[i] for i, n in enumerate(names)}
         return theta_hat, res
+
+
+@runtime_checkable
+class HasReturns(Protocol):
+    def get_returns(self) -> np.ndarray: ...
+
+
+@runtime_checkable
+class RegimeSwitchingCalibratable(Protocol):
+    def n_states(self) -> int: ...
+    def param_names(self) -> Tuple[str, ...]: ...
+    def unpack_params(self, theta: Array) -> Dict[str, Any]: ...
+    def log_likelihood(self, returns: np.ndarray, theta: Array,
+                       pi0: Optional[np.ndarray] = None) -> float: ...
+    def stationary_distribution(self, P: np.ndarray) -> np.ndarray: ...
+
+############################
+# Data container
+############################
+
+@dataclass
+class ReturnsData(HasReturns):
+    returns: np.ndarray
+    def get_returns(self) -> np.ndarray:
+        r = np.asarray(self.returns, dtype=float)
+        if r.ndim != 1:
+            raise ValueError("returns must be 1D")
+        if not np.all(np.isfinite(r)):
+            raise ValueError("returns contain NaN/inf")
+        return r
+
+
+class RegimeSwitchingCalibrator:
+    def __init__(self, method='L-BFGS-B', options: Optional[Dict[str,Any]]=None):
+        self.method=method
+        self.options=options or {"maxiter":500,"ftol":1e-9}
+
+    def _objective(self,theta,model,r,pi0):
+        return -model.log_likelihood(r,theta,pi0)
+
+    def fit(self, model:RegimeSwitchingCalibratable, market_data:HasReturns,
+            start_params:Array, bounds:Optional[Tuple[Tuple[float,float],...]]=None,
+            initial_state_probs:Optional[np.ndarray]=None) -> Tuple[OptimizeResult,Dict[str,float]]:
+        r=market_data.get_returns()
+        theta0=np.asarray(start_params,float)
+        if bounds and len(bounds)!=len(theta0):
+            raise ValueError('bounds length mismatch')
+        res=minimize(self._objective,theta0,args=(model,r,initial_state_probs),method=self.method,bounds=bounds,options=self.options)
+        pars=model.unpack_params(res.x)
+        out={}
+        K=model.n_states()
+        for i in range(K):
+            out[f'mu{i+1}']=float(pars['mu'][i])
+            out[f'sigma{i+1}']=float(pars['sigma'][i])
+        for i in range(K):
+            for j in range(K):
+                out[f'P{i+1}{j+1}']=float(pars['P'][i,j])
+        return res,out

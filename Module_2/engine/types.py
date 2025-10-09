@@ -1,6 +1,6 @@
 # sde/types.py
 import pandas as pd
-from typing import Protocol, Tuple, runtime_checkable, TypeVar, Any, ClassVar
+from typing import Protocol, Tuple, runtime_checkable, TypeVar, Any, ClassVar, Callable, Dict
 import numpy as np
 from dataclasses import replace
 
@@ -15,7 +15,8 @@ class _DataclassLike(Protocol):
 
 SelfModel = TypeVar("SelfModel", bound="Model")
 
-
+DriftFn = Callable[[Array, float, Dict[str, Any]], Array]  # (x,t,θ)->R^N
+DiffusionFn  = Callable[[Array, float, Dict[str, Any]], Array]  # (x,t,θ)->R^{N×K}
 class Model(_DataclassLike, Protocol):
     # Required attributes
     dim: int

@@ -133,8 +133,6 @@ class HestonCIRExact(Discretization):
         d = (4.0 * k_pos * th) / np.maximum(xi2, 1e-16)
         lam = (4.0 * k_pos * ek * v) / np.maximum(xi2 * one_minus_ek, 1e-16)
 
-        # Vectorized noncentral chi-square
-        # NOTE: Uses NumPy RNG; set np.random.seed(...) outside for reproducibility.
         v_next = c * np.random.noncentral_chisquare(df=d, nonc=lam, size=v.shape)
         v_next = np.maximum(v_next, 0.0)
 
@@ -150,8 +148,7 @@ class HestonCIRExact(Discretization):
         out[:, 1] = v_next
         return out
 # sde/schemes.py
-import numpy as np
-from .types import Model, Array, Discretization
+
 
 class SABRExactAlpha(Discretization):
     """Exact lognormal step for alpha; robust step for F using mid-step alpha."""

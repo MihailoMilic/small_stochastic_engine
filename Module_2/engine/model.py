@@ -4,14 +4,16 @@ import numpy as np
 
 from engine.calibration import MLECalibrator, SurfaceCalibrator, MLEProtocol, SurfaceProtocol
 from engine.types import Array, Model
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING, Tuple, Callable
 if TYPE_CHECKING:
     from engine.pricer import PricerProtocol
 from engine.levy import TruncatedLevyIncrement, LevyTriplet
 from scipy.linalg import expm
+from engine.types import DriftFn, DiffusionFn
 from scipy.stats import norm
 from scipy.special import factorial
 import pandas as pd
+
 @dataclass(frozen=True)
 class GBM(Model, MLEProtocol):
     mu: float
@@ -123,29 +125,7 @@ class MertonJD(Model, MLEProtocol, SurfaceProtocol):
         return np.array(prices)
     def _default_calibrator(self):
         return MLECalibrator()
-@dataclass(frozen=True)
-class AdditiveLevyModel(Model):
-    """1D additive Lévy process: dX_t = dL_t with triplet (b,σ,ν)."""
-    triplet: LevyTriplet
-    increment: TruncatedLevyIncrement
-    x0: float
 
-    @property
-    def dim(self): return 1
-    @property
-    def init(self): return np.array([self.x0], float)
-
-    # No state dependence: drift/diffusion are zero; all action is in 'jumps' hook.
-    def drift(self, x: Array, t: float) -> Array: return np.zeros_like(x)
-    def diffusion(self, x: Array, t: float) -> Array: return np.zeros_like(x)
-    def diffusion_dx(self, x: Array, t: float) -> Array: return np.zeros_like(x)
-
-    def jumps(self, x: Array, t: float, dt: float) -> Array:
-        # Return ΔL for each x in the batch (shape matches x)
-        return self.increment(dt, size=x.shape)
-
-    def extra_terms(self, x: Array, t: float, dt: float) -> Array:
-        return np.zeros_like(x)
 
 
 @dataclass(frozen=True)
@@ -395,6 +375,7 @@ class RegimeSwitchingModel:
     Q: np.ndarray                
     pi0: np.ndarray               
     dt: float
+    K: int = 2                 # number of regimes (models)
 
     # internal state
     _regimes: np.ndarray | None = None
@@ -463,3 +444,75 @@ class RegimeSwitchingModel:
     def diffusion_dx(self, x, t): return np.zeros_like(x)
     def jumps(self, x, dt): return np.zeros_like(x)
     def extra_terms(self, x, t, dt, dW): return np.zeros_like(x)
+    def n_states(self) -> int:
+        return self.K
+
+    def param_names(self) -> Tuple[str, ...]:
+        K = self.K
+        names = [f"mu{i+1}" for i in range(K)] + [f"log_sigma{i+1}" for i in range(K)]
+        for i in range(K):
+            for j in range(K):
+                names.append(f"logit_P{i+1}{j+1}")
+        return tuple(names)
+
+    @staticmethod
+    def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+        x = x - np.max(x, axis=axis, keepdims=True)
+        expx = np.exp(x)
+        return expx / np.sum(expx, axis=axis, keepdims=True)
+
+    def unpack_params(self, theta: Array) -> Dict[str, Any]:
+        theta = np.asarray(theta, dtype=float)
+        K = self.K
+        expected_len = 2*K + K*K
+        if theta.shape[0] != expected_len:
+            raise ValueError(f"Expected {expected_len} parameters, got {theta.shape[0]}")
+        mu = theta[:K]
+        sigma = np.exp(theta[K:2*K])
+        logits = theta[2*K:].reshape(K, K)
+        P = self._softmax(logits, axis=1)
+        return {"mu": mu, "sigma": sigma, "P": P}
+
+    def stationary_distribution(self, P: np.ndarray) -> np.ndarray:
+        w, v = np.linalg.eig(P.T)
+        idx = np.argmin(np.abs(w - 1.0))
+        pi = np.real(v[:, idx])
+        pi = np.maximum(pi, 0.0)
+        pi /= np.sum(pi)
+        return pi
+
+    @staticmethod
+    def _log_normal_pdf(x: np.ndarray, mean: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+        X = x[:, None]
+        M = mean[None, :]
+        S = sigma[None, :]
+        return -0.5*((X-M)**2)/(S**2) - np.log(S) - 0.5*np.log(2*np.pi)
+
+    def log_likelihood(self, returns: np.ndarray, theta: Array, pi0: Optional[np.ndarray]=None) -> float:
+        pars = self.unpack_params(theta)
+        mu, sigma, P = pars['mu'], pars['sigma'], pars['P']
+        K = self.K
+        T = len(returns)
+        if pi0 is None:
+            pi = self.stationary_distribution(P)
+        else:
+            pi = np.maximum(pi0,1e-300); pi/=np.sum(pi)
+        logB = self._log_normal_pdf(returns, mu, sigma)
+        logP = np.log(np.maximum(P,1e-300))
+        log_pi = np.log(np.maximum(pi,1e-300))
+
+        def logsumexp(a, axis=None):
+            m=np.max(a,axis=axis,keepdims=True)
+            return np.squeeze(np.log(np.sum(np.exp(a-m),axis=axis,keepdims=True))+m,axis=axis)
+
+        alpha=np.empty((T,K))
+        alpha[0,:]=log_pi+logB[0,:]
+        for t in range(1,T):
+            temp=alpha[t-1,:][:,None]+logP
+            alpha[t,:]=logB[t,:]+logsumexp(temp,axis=0)
+        ll=logsumexp(alpha[-1,:])
+        return float(ll) if np.isfinite(ll) else -1e20
+
+
+
+

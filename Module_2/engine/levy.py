@@ -1,6 +1,7 @@
 # levy.py
 from dataclasses import dataclass
 import numpy as np
+from engine.types import Model
 from typing import Callable, Protocol, Optional, Tuple
 from scipy.stats import norm
 from math import erf, sqrt
@@ -14,7 +15,7 @@ class LevyIncrement(Protocol):
 class LevyTriplet:
     drift: float                
     sigma: float                 
-    # ν is represented operationally via samplers / integrals below
+
 
 class LevyMeasure(Protocol):
     def large_jump_rate(self, eps: float) -> float: ...
@@ -23,7 +24,7 @@ class LevyMeasure(Protocol):
 
 
 @dataclass(frozen=True)
-# For production, implement exact truncated normal moments & conditional sampling; under is a readable sketch.
+
 class GaussianJumpMeasure(LevyMeasure):
     lam: float
     muJ: float
@@ -76,3 +77,27 @@ class TruncatedLevyIncrement:
             # accumulate sums into flat using in-place indexed addition
             np.add.at(flat, idx_rep, J)
         return flat.reshape(size)
+
+@dataclass(frozen=True)
+class AdditiveLevyModel(Model):
+    """1D additive Lévy process: dX_t = dL_t with triplet (b,σ,ν)."""
+    triplet: LevyTriplet
+    increment: TruncatedLevyIncrement
+    x0: float
+
+    @property
+    def dim(self): return 1
+    @property
+    def init(self): return np.array([self.x0], float)
+
+    # No state dependence: drift/diffusion are zero; all action is in 'jumps' hook.
+    def drift(self, x: Array, t: float) -> Array: return np.zeros_like(x)
+    def diffusion(self, x: Array, t: float) -> Array: return np.zeros_like(x)
+    def diffusion_dx(self, x: Array, t: float) -> Array: return np.zeros_like(x)
+
+    def jumps(self, x: Array, t: float, dt: float) -> Array:
+        # Return ΔL for each x in the batch (shape matches x)
+        return self.increment(dt, size=x.shape)
+
+    def extra_terms(self, x: Array, t: float, dt: float) -> Array:
+        return np.zeros_like(x)
