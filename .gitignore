@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Old engine iterations (superseded by root engine_nd/)
+Module_2/sde/
+Module_2/engine/
+Module_2/sde_nd_package/
+Module_2/engine_nd/
+Module_2/test.py
