@@ -9,8 +9,8 @@ def _last_state(path: Array) -> Array:
 # -------- GBM (1D) --------
 def gbm_a(path: Array, t: float, θ: Params) -> Array:
     x = _last_state(path)
-    μ = θ["mu"]
-    return np.array([μ * x[0]])
+    mu = θ["mu"]
+    return np.array([mu * x[0]])
 
 def gbm_B(path: Array, t: float, θ: Params) -> Array:
     x = _last_state(path)
@@ -21,26 +21,26 @@ def gbm_B(path: Array, t: float, θ: Params) -> Array:
 def heston_a(path: Array, t: float, θ: Params) -> Array:
     x = _last_state(path)
     S, v = x[0], x[1]
-    μ, κ, θv = θ["mu"], θ["kappa"], θ["theta_v"]
-    return np.array([μ*S, κ*(θv - v)])
+    mu, kappa, theta_v = θ["mu"], θ["kappa"], θ["theta_v"]
+    return np.array([mu*S, kappa*(theta_v - v)])
 
 def heston_B(path: Array, t: float, θ: Params) -> Array:
     x = _last_state(path)
     S, v = x[0], x[1]
-    ξ = θ["xi"]
+    xi = θ["xi"]
     v_rt = np.sqrt(max(v, 0.0))
     # Assumes Brownian driver already encodes correlation via Cholesky L (K=2)
     return np.array([[S*v_rt, 0.0],
-                     [0.0,    ξ*v_rt]])
+                     [0.0,    xi*v_rt]])
 
 # -------- Merton (log-price) --------
 def merton_log_a(path: Array, t: float, θ: Params) -> Array:
     x = _last_state(path)
     # x[0] = log S
-    μ, s, λ, mJ, sJ = θ["mu"], θ["sigma"], θ["lam"], θ["mJ"], θ["sJ"]
+    mu, s, λ, mJ, sJ = θ["mu"], θ["sigma"], θ["lam"], θ["mJ"], θ["sJ"]
     # compensate jumps in log domain
     kappa = np.exp(mJ + 0.5*sJ*sJ) - 1.0
-    drift_log = μ - 0.5*s*s - λ * np.log(1.0 + kappa)
+    drift_log = mu - 0.5*s*s - λ * np.log(kappa)
     return np.array([drift_log])
 
 def merton_log_B(path: Array, t: float, θ: Params) -> Array:

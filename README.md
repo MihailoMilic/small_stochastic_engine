@@ -1,5 +1,5 @@
 # psi-enterprise
-
+#Learning project, not validated.
 A modular quantitative trading research platform. The core library is **`engine_nd`** — an N-dimensional stochastic process engine that underpins strategy development, simulation, and calibration.
 
 ## engine_nd
